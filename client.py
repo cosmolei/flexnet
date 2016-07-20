@@ -10,6 +10,7 @@ import time
 import calendar
 import binascii
 import re
+import copy
 import pycrc
 
 import flexnet.file
@@ -318,19 +319,21 @@ class ManagerClient(_Client):
         print(p["license_file_text"])
         for vendor in p["vendors"].keys():
             v = p["vendors"][vendor]
+            print()
             print('vendor %s at %s@%s' % (vendor, v["port"], v["hostname"]))
             print()
             print('Features:')
             for feature in v["features"]:
                 print("   %s" % feature)
+            print()
             print('Licenses:')
             for lic in v["licenses"]:
                 print()
                 for key in lic.iterkeys():
                     print("%-15s%s" % (key, lic[key]))
-            if p.has_key("license_sets"):
-                for i in range(len(p["license_sets"])):
-                    lic = p["license_sets"][i]
+            if v.has_key("license_sets"):
+                for i in range(len(v["license_sets"])):
+                    lic = v["license_sets"][i]
                     print('  License Set %d:' % i)
                     for key in lic.iterkeys():
                         print("      %s: %s" % (key, lic[key]))
@@ -354,7 +357,7 @@ class ManagerClient(_Client):
         msg = self.request()
         self.server_params["license_file_text"] = msg["text"][0]
         parsed_lic_file = flexnet.file.flexnet_parse(msg["text"][0])
-        self.server_params["licenses"] = parsed_lic_file["licenses"]
+        self.server_params["licenses_in_file"] = parsed_lic_file["licenses"]
         return parsed_lic_file
 
     def query_vendor_list(self):
@@ -367,7 +370,8 @@ class ManagerClient(_Client):
 
     def query_vendor_details(self):
         """Connect to each vendor daemon for full details"""
-        vendors = self.server_params["vendors"]
+        p = self.server_params
+        vendors = p["vendors"]
         # Gather vendor hostnames and ports
         for vendor in vendors.keys():
             self.vendor = vendor
@@ -382,12 +386,26 @@ class ManagerClient(_Client):
             client.vendor = vendor_name
             client.hello()
             v["features"] = client.query_vendor_features()
-            v["licenses"] = {}
-            # TODO make it work for oldproto
+            v["licenses"] = []
+            # These are licenses reported directly by the vendor daemon,
+            # and not mentioned in the license file text from the license
+            # manager daemon.
+            # TODO make this work for oldproto
             if not self.oldproto:
-                v["licenses"] = client.query_vendor_licenses()
-            for license in v["licenses"]:
-                license["status"] = client.query_vendor_license_status(license["parsed"])
+                license_sets = client.query_vendor_licenses()
+                v["license_sets"] = license_sets
+                for license_set in license_sets:
+                    lics = flexnet.file.flexnet_parse(license_set["text"])["licenses"]
+                    v["licenses"].extend(lics)
+            # Alternatively, some licenses may only be listed in the license
+            # file text returned by the license manager.  So, also query
+            # licenses from the file that match this vendor.
+            license_file_entries = filter(lambda lic: lic["vendor"] == vendor_name, p["licenses_in_file"])
+            v["licenses"].extend(copy.deepcopy(license_file_entries))
+            # Now that all licenses for this vendor have been accounted for,
+            # actually request license status/usage from the vendor daemon
+            for lic in v["licenses"]:
+                lic["status"] = client.query_vendor_license_status(lic)
         return vendors
 
 
@@ -415,10 +433,6 @@ class VendorClient(_Client):
         for i in range(len(msg["text"])):
             lic = license_sets[i/8]
             lic[keys[i%8]] = msg["text"][i]
-        for lic in license_sets:
-            # NOTE: assuming there's only ever one license entry here.  Is that
-            # reasonable?
-            lic["parsed"] = flexnet.file.flexnet_parse(lic["text"])["licenses"][0]
         return license_sets
 
     def query_vendor_license_status(self, lic):
@@ -433,6 +447,7 @@ class VendorClient(_Client):
             req = '\x6c' + chr(cb) + req
             req = req.ljust(147, '\x00')
             response = self._query(req)
+            # TODO currently broken on Cadence due to server_params reference
             # Cadence... these should probably go on the previous usage entry?
             # ugly, ugly, ugly
             while ord(response[0]) != 0x4e:

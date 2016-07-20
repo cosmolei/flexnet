@@ -7,10 +7,9 @@ import flexnet.client
 import flexnet.file
 
 def get_license_file(srv):
-    c = flexnet.client.FlexNetClient(srv)
-    c.connect()
-    c.hello()
-    c.query_license_file_contents()
+    c = flexnet.client.ManagerClient(srv)
+    c.query_server()
+    c.query_server_license_file_contents()
     return c.server_params["license_file_text"]
 
 def main(args):
