@@ -43,7 +43,8 @@ CRCWIDTH = 14
 CRCPOLY = 0x2e97
 crc = pycrc.Crc(width=CRCWIDTH, poly=CRCPOLY, reflect_in=True, xor_in=0, reflect_out=True, xor_out=0)
 
-class FlexNetClient():
+class _Client():
+    """Base class for both server types"""
 
     def __init__(self, server, port=None):
         if port is None:
@@ -55,6 +56,7 @@ class FlexNetClient():
         self.debug    = False  # show raw binary sent and received
         self.verbose  = False  # show parsed messages received
         self.oldproto = None   # will be set later if server version < VER_NEW
+        self.vendors  = []     # Vendor daemon connections via VendorClient()
 
         self.user    = os.environ['USER']
         self.host    = socket.gethostname()
@@ -67,171 +69,6 @@ class FlexNetClient():
         self.server_params = {}
 
         self.connect()
-
-    def query_everything(self):
-        """Query server for all available information from all vendors"""
-        # get initial data at the given port
-        self.query_server()
-        self.query_server_license_file_path()
-        self.query_server_license_file_contents()
-        self.query_vendor_list()
-        # Connect to each vendor port for full details
-        self.query_vendor_details()
-
-    def report_everything(self):
-        """Query everything and print results to standard output"""
-        self.query_everything()
-        p = self.server_params
-        print('Server hostname:   %s'    % p["server_hostname"])
-        print('Server daemon:     %s'    % p["server_daemon"])
-        print('Server version:    %s.%s' % p["server_version"])
-        print('License File Path: %s'    % p ["license_file_path"])
-        print('Vendor daemons:    %s'    % ', '.join(p["vendors"]))
-        print('License File:')
-        print(p["license_file_text"])
-        for vendor in p["vendors"].keys():
-            v = p["vendors"][vendor]
-            print('vendor %s at %s@%s' % (vendor, v["port"], v["hostname"]))
-            print()
-            print('Features:')
-            for feature in v["features"]:
-                print("   %s" % feature)
-            print('Licenses:')
-            for lic in v["licenses"]:
-                print()
-                for key in lic.iterkeys():
-                    print("%-15s%s" % (key, lic[key]))
-            if p.has_key("license_sets"):
-                for i in range(len(p["license_sets"])):
-                    lic = p["license_sets"][i]
-                    print('  License Set %d:' % i)
-                    for key in lic.iterkeys():
-                        print("      %s: %s" % (key, lic[key]))
-
-    def query_server(self):
-        """Make initial connection and query main server details"""
-        msg = self.hello()
-        self.server_params["server_hostname"] = msg["hostname"]
-        self.server_params["server_daemon"]   = msg["daemon"]
-        self.server_params["server_version"]  = msg["server_version"]
-
-    def query_server_license_file_path(self):
-        """Query server for filesystem path to license file"""
-        msg = self.request("getpaths")
-        license_file_path = msg["text"][0]
-        self.server_params["license_file_path"] = license_file_path
-        return license_file_path
-
-    def query_server_license_file_contents(self):
-        """Query server for contents of license file text"""
-        msg = self.request()
-        self.server_params["license_file_text"] = msg["text"][0]
-        parsed_lic_file = flexnet.file.flexnet_parse(msg["text"][0])
-        self.server_params["licenses"] = parsed_lic_file["licenses"]
-        return parsed_lic_file
-
-    def query_vendor_list(self):
-        """Get list of all vendor names"""
-        msg = self.request("dlist")
-        txt = msg["text"][0].strip()
-        vendor_names = txt.split()
-        self.server_params["vendors"] = {key: {} for key in vendor_names}
-        return vendor_names
-
-    def query_vendor_details(self):
-        """Connect to each vendor daemon for full details"""
-        vendors = self.server_params["vendors"]
-        for vendor in vendors.keys():
-            self.vendor = vendor
-            msg = self.hello()
-            vendors[vendor]["hostname"] = msg["vendor_hostname"]
-            vendors[vendor]["port"] = msg["vendor_port"]
-        for vendor in vendors.keys():
-            self.close()
-            # get more data from other port
-            self.server = msg["vendor_hostname"]
-            self.port = msg["vendor_port"]
-            self.connect()
-            self.hello()
-            vendors[vendor]["features"] = self.query_vendor_features()
-            vendors[vendor]["licenses"] = {}
-            # TODO make it work for oldproto
-            if not self.oldproto:
-                vendors[vendor]["licenses"] = self.query_vendor_licenses()
-            for license in vendors[vendor]["licenses"]:
-                license["status"] = self.query_vendor_license_status(license["parsed"])
-        return vendors
-
-    # These methods require a connection to a vendor daemon first
-
-    def query_vendor_features(self):
-        """Query a vendor daemon for a list of available features"""
-        if self.oldproto:
-            msg = self.stub_old('\x3d\xda\x6c\x31')
-        else:
-            msg = self.stub()
-        features = msg["text"][0].split()
-        return features
-
-    def query_vendor_licenses(self):
-        """Query a vendor daemon for full license details"""
-        msg = self.stub(data='\x01\x00\x00\x00\x00', reqtype=0x0127)
-        # Sometimes this will have a garbage whitespace entry.
-        # Remove those before continuing.
-        msg["text"] = filter(lambda x: not re.match('^\s*$', x), msg["text"])
-        num = len(msg["text"])/8
-        license_sets =[{} for x in range(num)]
-        keys = ["fid", "sig", "names", "date1", "date2", "fid", "url", "text"]
-        for i in range(len(msg["text"])):
-            lic = license_sets[i/8]
-            lic[keys[i%8]] = msg["text"][i]
-        for lic in license_sets:
-            # NOTE: assuming there's only ever one license entry here.  Is that
-            # reasonable?
-            lic["parsed"] = flexnet.file.flexnet_parse(lic["text"])["licenses"][0]
-        return license_sets
-
-    def query_vendor_license_status(self, lic):
-        """Query a vendor daemon for current usage on a license"""
-        feature = lic["feature"]
-        sig = lic.get("SIGN")
-        if not sig:
-            sig = lic["others"][0]
-        if self.oldproto:
-            req = feature.ljust(31, '\x00') + sig.ljust(21, '\x00') + '1'
-            cb = (sum(map(ord, req))+108)%256
-            req = '\x6c' + chr(cb) + req
-            req = req.ljust(147, '\x00')
-            response = self._query(req)
-            # Cadence... these should probably go on the previous usage entry?
-            # ugly, ugly, ugly
-            while ord(response[0]) != 0x4e:
-                lics = self.server_params["licenses"]
-                response = self._query(req)
-                idx = lics.index(lic)-1
-                #lics[idx]["status"]["usage"].append(response)
-            msg = self._request_parse(response)
-            status = {}
-            status["used"] = int(msg["text"][0])
-            status["total"] = int(msg["text"][1])
-            status["timestamp"] = time.gmtime(int(msg["text"][2]))
-        else:
-            req = '\x00'.join([feature, sig[:20]]) + '\x00'*4 + '\x01'
-            msg = self.stub(data=req, reqtype=TYPE_REQLIC)
-            data = filter(len, msg["text"])
-            status = {}
-            status["used"] = int(data[0][2:])
-            status["total"] = int(data[1])
-            status["timestamp"] = time.gmtime(int(data[2]))
-        status["usage"] = []
-        for i in range(status["used"]):
-            response = self._query()
-            status["usage"].append(response)
-        # Cadence...
-        #if self.oldproto:
-        #    self.close()
-        #    self.connect()
-        return status
 
     # Lower-level public methods for specific connection and request types
 
@@ -246,13 +83,13 @@ class FlexNetClient():
         self.s.close()
 
     def hello(self):
-        """Send introductory message to main server"""
+        """Send introductory message to license manager server"""
         req = self._hello_pack()
         response = self._query(req)
         return self._request_parse(response)
 
     def request(self, command=""):
-        """Send a request with a specified command to main server
+        """Send a request with a specified command to license manager server
 
         Commands I know of are:
            (blank)  - fetch license file contents
@@ -453,3 +290,175 @@ class FlexNetClient():
 
     def _length_remaining(self, data):
             return int(data[2:13].split('\x00')[0])
+
+
+class ManagerClient(_Client):
+    """A connection to a license manager daemon"""
+
+    def query_everything(self):
+        """Query server for all available information from all vendors"""
+        # get initial data at the given port
+        self.query_server()
+        self.query_server_license_file_path()
+        self.query_server_license_file_contents()
+        self.query_vendor_list()
+        # Connect to each vendor port for full details
+        self.query_vendor_details()
+
+    def report_everything(self):
+        """Query everything and print results to standard output"""
+        self.query_everything()
+        p = self.server_params
+        print('Server hostname:   %s'    % p["server_hostname"])
+        print('Server daemon:     %s'    % p["server_daemon"])
+        print('Server version:    %s.%s' % p["server_version"])
+        print('License File Path: %s'    % p ["license_file_path"])
+        print('Vendor daemons:    %s'    % ', '.join(p["vendors"]))
+        print('License File:')
+        print(p["license_file_text"])
+        for vendor in p["vendors"].keys():
+            v = p["vendors"][vendor]
+            print('vendor %s at %s@%s' % (vendor, v["port"], v["hostname"]))
+            print()
+            print('Features:')
+            for feature in v["features"]:
+                print("   %s" % feature)
+            print('Licenses:')
+            for lic in v["licenses"]:
+                print()
+                for key in lic.iterkeys():
+                    print("%-15s%s" % (key, lic[key]))
+            if p.has_key("license_sets"):
+                for i in range(len(p["license_sets"])):
+                    lic = p["license_sets"][i]
+                    print('  License Set %d:' % i)
+                    for key in lic.iterkeys():
+                        print("      %s: %s" % (key, lic[key]))
+
+    def query_server(self):
+        """Make initial connection and query license manager details"""
+        msg = self.hello()
+        self.server_params["server_hostname"] = msg["hostname"]
+        self.server_params["server_daemon"]   = msg["daemon"]
+        self.server_params["server_version"]  = msg["server_version"]
+
+    def query_server_license_file_path(self):
+        """Query server for filesystem path to license file"""
+        msg = self.request("getpaths")
+        license_file_path = msg["text"][0]
+        self.server_params["license_file_path"] = license_file_path
+        return license_file_path
+
+    def query_server_license_file_contents(self):
+        """Query server for contents of license file text"""
+        msg = self.request()
+        self.server_params["license_file_text"] = msg["text"][0]
+        parsed_lic_file = flexnet.file.flexnet_parse(msg["text"][0])
+        self.server_params["licenses"] = parsed_lic_file["licenses"]
+        return parsed_lic_file
+
+    def query_vendor_list(self):
+        """Get list of all vendor names"""
+        msg = self.request("dlist")
+        txt = msg["text"][0].strip()
+        vendor_names = txt.split()
+        self.server_params["vendors"] = {key: {} for key in vendor_names}
+        return vendor_names
+
+    def query_vendor_details(self):
+        """Connect to each vendor daemon for full details"""
+        vendors = self.server_params["vendors"]
+        # Gather vendor hostnames and ports
+        for vendor in vendors.keys():
+            self.vendor = vendor
+            msg = self.hello()
+            vendors[vendor]["hostname"] = msg["vendor_hostname"]
+            vendors[vendor]["port"] = msg["vendor_port"]
+        # Connect to each vendor
+        for vendor_name in vendors.keys():
+            v = vendors[vendor_name]
+            client = VendorClient(v["hostname"], v["port"])
+            self.vendors.append(client)
+            client.vendor = vendor_name
+            client.hello()
+            v["features"] = client.query_vendor_features()
+            v["licenses"] = {}
+            # TODO make it work for oldproto
+            if not self.oldproto:
+                v["licenses"] = client.query_vendor_licenses()
+            for license in v["licenses"]:
+                license["status"] = client.query_vendor_license_status(license["parsed"])
+        return vendors
+
+
+class VendorClient(_Client):
+    """A connection to a license vendor daemon"""
+
+    def query_vendor_features(self):
+        """Query a vendor daemon for a list of available features"""
+        if self.oldproto:
+            msg = self.stub_old('\x3d\xda\x6c\x31')
+        else:
+            msg = self.stub()
+        features = msg["text"][0].split()
+        return features
+
+    def query_vendor_licenses(self):
+        """Query a vendor daemon for full license details"""
+        msg = self.stub(data='\x01\x00\x00\x00\x00', reqtype=0x0127)
+        # Sometimes this will have a garbage whitespace entry.
+        # Remove those before continuing.
+        msg["text"] = filter(lambda x: not re.match('^\s*$', x), msg["text"])
+        num = len(msg["text"])/8
+        license_sets =[{} for x in range(num)]
+        keys = ["fid", "sig", "names", "date1", "date2", "fid", "url", "text"]
+        for i in range(len(msg["text"])):
+            lic = license_sets[i/8]
+            lic[keys[i%8]] = msg["text"][i]
+        for lic in license_sets:
+            # NOTE: assuming there's only ever one license entry here.  Is that
+            # reasonable?
+            lic["parsed"] = flexnet.file.flexnet_parse(lic["text"])["licenses"][0]
+        return license_sets
+
+    def query_vendor_license_status(self, lic):
+        """Query a vendor daemon for current usage on a license"""
+        feature = lic["feature"]
+        sig = lic.get("SIGN")
+        if not sig:
+            sig = lic["others"][0]
+        if self.oldproto:
+            req = feature.ljust(31, '\x00') + sig.ljust(21, '\x00') + '1'
+            cb = (sum(map(ord, req))+108)%256
+            req = '\x6c' + chr(cb) + req
+            req = req.ljust(147, '\x00')
+            response = self._query(req)
+            # Cadence... these should probably go on the previous usage entry?
+            # ugly, ugly, ugly
+            while ord(response[0]) != 0x4e:
+                lics = self.server_params["licenses"]
+                response = self._query(req)
+                idx = lics.index(lic)-1
+                #lics[idx]["status"]["usage"].append(response)
+            msg = self._request_parse(response)
+            status = {}
+            status["used"] = int(msg["text"][0])
+            status["total"] = int(msg["text"][1])
+            status["timestamp"] = time.gmtime(int(msg["text"][2]))
+        else:
+            req = '\x00'.join([feature, sig[:20]]) + '\x00'*4 + '\x01'
+            msg = self.stub(data=req, reqtype=TYPE_REQLIC)
+            data = filter(len, msg["text"])
+            status = {}
+            status["used"] = int(data[0][2:])
+            status["total"] = int(data[1])
+            status["timestamp"] = time.gmtime(int(data[2]))
+        status["usage"] = []
+        for i in range(status["used"]):
+            response = self._query()
+            status["usage"].append(response)
+        # Cadence...
+        #if self.oldproto:
+        #    self.close()
+        #    self.connect()
+        return status

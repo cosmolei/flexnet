@@ -16,7 +16,7 @@ def get_license_file(srv):
 def main(args):
     if len(args) == 2:
         port_at_server = args[1]
-        c = flexnet.client.FlexNetClient(port_at_server)
+        c = flexnet.client.ManagerClient(port_at_server)
         #c.verbose = True
         c.report_everything()
 
