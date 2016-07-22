@@ -1,7 +1,5 @@
 """FlexNet text configuration file."""
 
-from __future__ import print_function
-
 import re
 import StringIO
 import shlex
@@ -71,12 +69,13 @@ def _flexnet_parse(lines):
                 lic['quantity'] = 0
             else: 
                 lic['quantity'] = int(line[5])
+            # NOTE: The parsing gets too easily confused with the extra entries
             opts = line[6:]
             while opts.count('=') > 0:
                 i = opts.index('=')
                 val = opts.pop(i+1).strip('"')
                 opts.pop(i)
-                key = opts.pop(i-1).strip('"')
+                key = opts.pop(i-1).strip('"').lower()
                 while len(opts)>1 and opts[1] == '=':
                     val += opts.pop(1)
                     val += opts.pop(1)

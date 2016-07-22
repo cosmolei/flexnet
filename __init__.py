@@ -5,6 +5,7 @@
 import sys
 import flexnet.client
 import flexnet.file
+import flexnet.licenses
 
 def get_license_file(srv):
     c = flexnet.client.ManagerClient(srv)
