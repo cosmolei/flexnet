@@ -66,8 +66,6 @@ class _Client(object):
         self.arch    = 'x64_lsb' # OS/arch ("64-bit Linux Standard Base"?)
         self.version = (11,11) # "this" lmstat version
 
-        self.server_params = {}
-
         self.connect()
 
     # Lower-level public methods for specific connection and request types
@@ -85,18 +83,6 @@ class _Client(object):
     def hello(self):
         """Send introductory message to license manager server"""
         req = self._hello_pack()
-        response = self._query(req)
-        return self._request_parse(response)
-
-    def request(self, command=""):
-        """Send a request with a specified command to license manager server
-
-        Commands I know of are:
-           (blank)  - fetch license file contents
-           dlist    - fetch vendor names
-           getpaths - fetch license file path relative to daemon installation
-        """
-        req = self._request_pack(command)
         response = self._query(req)
         return self._request_parse(response)
 
@@ -123,17 +109,9 @@ class _Client(object):
         req = prefix + req
         return req
 
-    def _request_pack(self, command=""):
-        data = ( self.user,
-                 self.host,
-                 self.server_params["server_daemon"],
-                 self.tty,
-                 command )
-        req = '\x01\x04' + ''.join([d+'\x00' for d in data])
-        headerstr = self._header_create(req)
-        req = headerstr + req
-        return req
-
+    # TODO many of these response types only occur for certain requests.
+    # Refactor this to separate them and move things to the other classes where
+    # needed.
     def _request_parse(self, response):
         header = self._header_parse(response)
         message = {}
@@ -156,9 +134,9 @@ class _Client(object):
             if ver < ((VER_NEW[0]<<8) | VER_NEW[1]):
                 self.oldproto = True
         # What I'm calling STUBR (stub response) here actually looks like a
-        # redirect message, to point to a different port and possibly a
-        # different host altogether.  This follows a hello() with a vendor
-        # specified.
+        # redirect message, to point to a vendor daemon running on a different
+        # port and possibly a different host altogether.  This follows a
+        # hello() with a vendor specified.
         elif header.get("type") == TYPE_STUBR:
             payload = response[header["len"]:]
             hostname, remainder = payload.split('\x00', 1)
@@ -281,11 +259,16 @@ class _Client(object):
 
 
 class ManagerClient(_Client):
-    """A connection to a license manager daemon"""
+    """A connection to a license manager daemon.
+
+    This will follow redirects to managers running on other hosts if necessary.
+    """
 
     def __init__(self, server, port=None):
         super(ManagerClient, self).__init__(server, port)
         self.vendors = [] # Vendor daemon connections via VendorClient()
+        # TODO turn these into real attributes
+        self.server_params = {}
 
     def query_everything(self):
         """Query server for all available information from all vendors"""
@@ -334,6 +317,14 @@ class ManagerClient(_Client):
         self.server_params["server_hostname"] = msg["hostname"]
         self.server_params["server_daemon"]   = msg["daemon"]
         self.server_params["server_version"]  = msg["server_version"]
+        # For standalone managers that's all we need, but for redundant
+        # managers it might be directing us to a different server entirely.
+        # Either way just re-connecting with the specified hostname should
+        # work.
+        self.close()
+        self.server = msg["hostname"]
+        self.connect()
+        self.hello()
 
     def query_server_license_file_path(self):
         """Query server for filesystem path to license file"""
@@ -402,6 +393,29 @@ class ManagerClient(_Client):
                 client.query_vendor_license_status(lic)
         return vendors
 
+    def request(self, command=""):
+        """Send a request with a specified command to license manager server
+
+        Commands I know of are:
+           (blank)  - fetch license file contents
+           dlist    - fetch vendor names
+           getpaths - fetch license file path relative to daemon installation
+        """
+        req = self._request_pack(command)
+        response = self._query(req)
+        return self._request_parse(response)
+
+    def _request_pack(self, command=""):
+        data = ( self.user,
+                 self.host,
+                 self.server_params["server_daemon"],
+                 self.tty,
+                 command )
+        req = '\x01\x04' + ''.join([d+'\x00' for d in data])
+        headerstr = self._header_create(req)
+        req = headerstr + req
+        return req
+
 
 class VendorClient(_Client):
     """A connection to a license vendor daemon"""
@@ -451,11 +465,10 @@ class VendorClient(_Client):
             req = req.ljust(147, '\x00')
             response = self._query(req)
 
-            # TODO currently broken on Cadence due to server_params reference
             # Cadence... these should probably go on the previous usage entry?
             # ugly, ugly, ugly
             while ord(response[0]) != 0x4e:
-                lics = self.server_params["licenses"]
+                lics = self.licenses
                 response = self._query(req)
                 idx = lics.index(lic)-1
                 #lics[idx]["status"]["usage"].append(response)
