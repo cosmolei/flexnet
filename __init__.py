@@ -17,7 +17,6 @@ def main(args):
     if len(args) == 2:
         port_at_server = args[1]
         c = flexnet.client.ManagerClient(port_at_server)
-        #c.verbose = True
         c.report_everything()
 
 if __name__ == "__main__":
