@@ -16,24 +16,22 @@ import pycrc
 import flexnet.file
 
 HEADERLEN = 20
-TYPE_REQLIC1 = 0x004e
-TYPE_REQ     = 0x0108
-TYPE_HELLO   = 0x010e
-TYPE_STUBR   = 0x0113
-TYPE_REQLIC2 = 0x0114
-TYPE_STUB2   = 0x0128
-TYPE_STUB    = 0x013b
-TYPE_REQLIC  = 0x013c
-TYPE_RESP    = 0x0146
+TYPE_REQLIC1 = 0x004e # response: license status (vendor)
+TYPE_REQ     = 0x0108 # request: command (manager)
+TYPE_HELLO   = 0x010e # response: hello
+TYPE_STUBR   = 0x0113 # response: hello w/ vendor set (manager)
+TYPE_REQLIC2 = 0x0114 # response: license usage (vendor)
+TYPE_LICSET  = 0x0127 # request: vendor's licenses (vendor)
+TYPE_STUB2   = 0x0128 # response: vendor's licenses (vendor)
+TYPE_STUB    = 0x013b # request: vendor's features (vendor)
+TYPE_REQLIC  = 0x013c # request: license status (vendor)
+TYPE_RESP    = 0x0146 # response: command (manager)
 HEADERLENS = {}
 HEADERLENS[TYPE_REQLIC1] = 20
-HEADERLENS[TYPE_REQ]     = 22
 HEADERLENS[TYPE_HELLO]   = 24
 HEADERLENS[TYPE_STUBR]   = 20
 HEADERLENS[TYPE_REQLIC2] = 20
 HEADERLENS[TYPE_STUB2]   = 20
-HEADERLENS[TYPE_STUB]    = 24
-HEADERLENS[TYPE_REQLIC]  = 20
 HEADERLENS[TYPE_RESP]    = 24
 PREFIXES = [0x2f, 0x4c, 0x4e]
 
@@ -58,7 +56,7 @@ class _Client(object):
         self.verbose  = False  # show parsed messages received
         self.oldproto = None   # will be set later if server version < VER_NEW
 
-        self.user    = os.environ['USER']
+        self.user    = os.environ.get('USER') or ''
         self.host    = socket.gethostname()
         self.vendor  = "" # empty to start, then vendor name
         self.tty     = '/dev/pts/1'
@@ -116,14 +114,19 @@ class _Client(object):
         header = self._header_parse(response)
         message = {}
         message["header"] = header
+
         # Old version, chunked text data
+
         if header["prefix"] == 0x4c:
             resp_text = ""
             for i in range(0, len(response), 147):
                 resp_text += response[i+13:i+147]
             resp_text = resp_text.strip('\x00').split('\x00')
             message["text"] = resp_text
+
         # Otherwise newer version
+
+        # response to a hello() request
         elif header.get("type") == TYPE_HELLO:
             txt = response[header["len"]:].strip('\x00').split('\x00')
             message["hostname"]        = txt[0]
@@ -133,6 +136,7 @@ class _Client(object):
             ver = ver[0] << 8 | ver[1]
             if ver < ((VER_NEW[0]<<8) | VER_NEW[1]):
                 self.oldproto = True
+
         # What I'm calling STUBR (stub response) here actually looks like a
         # redirect message, to point to a vendor daemon running on a different
         # port and possibly a different host altogether.  This follows a
@@ -142,6 +146,8 @@ class _Client(object):
             hostname, remainder = payload.split('\x00', 1)
             message["vendor_hostname"] = hostname
             message["vendor_port"], = struct.unpack('!L', remainder[:4])
+
+        # Response to request for license sets?
         elif header.get("type") == TYPE_STUB2:
             # The "text" is interspersed with runs of NULLs and 0x01 and 0x07.
             # No idea what that means.
@@ -149,10 +155,50 @@ class _Client(object):
             strip_binary = lambda x: x.strip('\x01\x07')
             fields = filter(len, map(strip_binary, txt.split('\x00')))
             message["text"] = fields
+
+        # Response to license status request.
+        elif header.get("type") == TYPE_REQLIC1:
+            payload = response[header["len"]:]
+            # mysterious 2-byte prefix, followed by ASCII integers for number
+            # used, number in total, and a timestamp.
+            prefix    = struct.unpack('BB', payload[0:2])
+            fields = filter(len, payload[2:].split('\x00'))
+            used      = fields[0]
+            total     = fields[1]
+            timestamp = fields[2]
+            message["prefix"]    = prefix
+            message["used"]      = int(used)
+            message["total"]     = int(total)
+            message["timestamp"] = time.gmtime(int(timestamp))
+
+        # Response showing license usage following a license status request.
+        # One response per group reservation/user chckout for that license.
+        elif header.get("type") == TYPE_REQLIC2:
+            segments = response[header["len"]:].split('\x01',1)
+            # null-terminated strings
+            txtfields = segments[0].split('\x00')
+            # group reservations are handled separately.  They have an extra
+            # 'G' at the beginning of the name field and zeros for the binary
+            # segment.
+            if not sum(map(ord,segments[1])) and txtfields[0][0] == 'G':
+                message["group_reservation"] = txtfields[0][1:]
+            else:
+                message["user"]    = txtfields[0]
+                message["host"]    = txtfields[1]
+                message["tty"]     = txtfields[2]
+                message["version"] = txtfields[3]
+                # remaining bytes of binary data
+                timestamp = segments[1][4:8]
+                number    = segments[1][8:16]
+                timeval, = struct.unpack('!L', timestamp)
+                message["time"] = time.gmtime(timeval)
+                message["number"], = struct.unpack('!Q', number)
+
         else:
             txt = response[header["len"]:].strip('\x00').split('\x00')
             fields = filter(len, txt)
             message["text"] = fields
+
         if self.verbose:
             sys.stderr.write("Parsed Response:\n")
             for key in message.keys():
@@ -209,6 +255,9 @@ class _Client(object):
             timeval, = struct.unpack('!L', data[8:12])
             header["time"] = time.gmtime(timeval)
             header["txt_len"], = struct.unpack('!H', data[22:24])
+        elif header["type"] == TYPE_REQLIC2:
+            timeval, = struct.unpack('!L', data[8:12])
+            header["time"] = time.gmtime(timeval)
         self._header_validate(data, header)
         return header
 
@@ -438,7 +487,7 @@ class VendorClient(_Client):
 
     def query_vendor_licenses(self):
         """Query a vendor daemon for full license details"""
-        msg = self._stub(data='\x01\x00\x00\x00\x00', reqtype=0x0127)
+        msg = self._stub(data='\x01\x00\x00\x00\x00', reqtype=TYPE_LICSET)
         # Sometimes this will have a garbage whitespace entry.
         # Remove those before continuing.
         msg["text"] = filter(lambda x: not re.match('^\s*$', x), msg["text"])
@@ -451,58 +500,79 @@ class VendorClient(_Client):
         self.license_sets.extend([flexnet.licenses.LicenseSet(lic) for lic in license_sets])
         return license_sets
 
+    # TODO this is broken on Cadence.
     def query_vendor_license_status(self, lic):
-        """Query a vendor daemon for current usage on a license"""
+        """Query a vendor daemon for current status and usage on a license"""
         feature = lic.feature
         sign = lic.sign
         if not sign:
             sign = lic.others[0]
-        status = {}
+
+        # Query general status
         if self.oldproto:
-            req = feature.ljust(31, '\x00') + sign.ljust(21, '\x00') + '1'
-            cb = (sum(map(ord, req))+108)%256
-            req = '\x6c' + chr(cb) + req
-            req = req.ljust(147, '\x00')
-            response = self._query(req)
-
-            # Cadence... these should probably go on the previous usage entry?
-            # ugly, ugly, ugly
-            while ord(response[0]) != 0x4e:
-                lics = self.licenses
-                response = self._query(req)
-                idx = lics.index(lic)-1
-                #lics[idx]["status"]["usage"].append(response)
-
-            msg = self._request_parse(response)
-            status["used"] = int(msg["text"][0])
-            status["total"] = int(msg["text"][1])
-            status["timestamp"] = time.gmtime(int(msg["text"][2]))
+            status = self._query_license_status_old(feature, sign)
         else:
-            req = '\x00'.join([feature, sign[:20]]) + '\x00'*4 + '\x01'
-            msg = self._stub(data=req, reqtype=TYPE_REQLIC)
-            data = filter(len, msg["text"])
-            status["used"] = int(data[0][2:])
-            status["total"] = int(data[1])
-            status["timestamp"] = time.gmtime(int(data[2]))
+            status = self._query_license_status(feature, sign)
+
+        # Query usage.  Implicitly refers to last license that was checked; no
+        # new request is sent.
         status["usage"] = []
         for i in range(status["used"]):
-            response = self._query()
+            response = self._query_license_usage()
             status["usage"].append(response)
-        # Cadence...
-        #if self.oldproto:
-        #    self.close()
-        #    self.connect()
+
         lic.status.update(status)
         return status
 
+    def _query_license_status(self, feature, sign):
+        """Query status on a single license by feature name and signature"""
+        status = {}
+        req = '\x00'.join([feature, sign[:20]]) + '\x00'*4 + '\x01'
+        msg = self._stub(data=req, reqtype=TYPE_REQLIC)
+        status["prefix"] = msg["prefix"]
+        status["used"] = msg["used"]
+        status["total"] = msg["total"]
+        status["timestamp"] = msg["timestamp"]
+        return status
+
+    def _query_license_status_old(self, feature, sign):
+        """Query status on a single license by feature name and signature (older version)"""
+        status = {}
+        req = feature.ljust(31, '\x00') + sign.ljust(21, '\x00') + '1'
+        cb = (sum(map(ord, req))+108)%256
+        req = '\x6c' + chr(cb) + req
+        req = req.ljust(147, '\x00')
+        response = self._query(req)
+
+        # Cadence... these should probably go on the previous usage entry?
+        # ugly, ugly, ugly
+        while ord(response[0]) != 0x4e:
+            lics = self.licenses
+            response = self._query(req)
+            #idx = lics.index(lic)-1
+            #lics[idx].status["usage"].append(response)
+
+        msg = self._request_parse(response)
+        status["used"] = int(msg["text"][0])
+        status["total"] = int(msg["text"][1])
+        status["timestamp"] = time.gmtime(int(msg["text"][2]))
+        return status
+
+    def _query_license_usage(self):
+        """Query usage details on the last license that was checked"""
+        response = self._query()
+        msg = self._request_parse(response)
+        del msg["header"]
+        return msg
+
     def _stub_old(self, data):
-        """Send a request to a vendor daemon (older protocol)"""
+        """Send a general request to a vendor daemon (older protocol)"""
         req = data.ljust(147, '\x00')
         response = self._query(req)
         return self._request_parse(response)
 
     def _stub(self, data='\x31\x00\x30\x00', reqtype=TYPE_STUB):
-        """Send a request to a vendor daemon"""
+        """Send a general request to a vendor daemon"""
         req = self._header_create(data, reqtype) + data
         response = self._query(req)
         return self._request_parse(response)
