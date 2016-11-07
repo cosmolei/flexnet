@@ -37,7 +37,7 @@ bytes prepended to the message bytes, with a modular one-byte sum of all bytes
 
 ## Dependencies
 
-This depends on [pycrc](https://pycrc.org/PyCRC) for calculating CRC values for
+This depends on [pycrc](https://pycrc.org/) for calculating CRC values for
 the transmitted messages.
 
 [tcpdump]: http://www.tcpdump.org/
